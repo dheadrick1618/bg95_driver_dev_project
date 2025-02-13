@@ -1,0 +1,9 @@
+idf_component_register(
+	SRCS
+	"test_main.c"
+	"test_dummy.c"
+	INCLUDE_DIRS
+	"."
+	REQUIRES
+	unity
+	freertos)

@@ -1,0 +1,3 @@
+[submodule "components/bg95_driver"]
+	path = components/bg95_driver
+	url = git@github.com:dheadrick1618/bg95_driver.git

@@ -7,6 +7,8 @@ void run_test_dummy(void);
 
 void run_test_at_cmd_parser_all(void);
 
+void run_test_mock_uart_interface_all(void);
+
 void app_main(void)
 {
   // UNITY_BEGIN();
@@ -17,10 +19,12 @@ void app_main(void)
 
   // TODO: implement other tests
   // printf("\n=== Other Tests ===\n");
-  //
 
-  printf("\n=== AT CMD parser Tests ===\n");
-  run_test_at_cmd_parser_all();
+  // printf("\n=== AT CMD parser Tests ===\n");
+  // run_test_at_cmd_parser_all();
+
+  printf("\n=== MOCK UART Interface Tests ===\n");
+  run_test_mock_uart_interface_all();
 
   // UNITY_END();
 }

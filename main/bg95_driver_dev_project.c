@@ -1,4 +1,6 @@
 #include "bg95_driver.h"
+#include "freertos/idf_additions.h"
+#include "freertos/projdefs.h"
 
 #include <esp_err.h>
 #include <esp_log.h>
@@ -54,22 +56,41 @@ static void init_bg95(void)
   }
 }
 
+static void conn_to_network_bearer_task(void* pvParams)
+{
+  bg95_handle_t* handle = (bg95_handle_t*) pvParams;
+
+  esp_err_t err;
+
+  for (;;)
+  {
+    // Check SIM card status
+    cpin_read_response_t pin_status = {0};
+
+    err = bg95_get_pin_status(handle, &pin_status);
+    if (err != ESP_OK)
+    {
+      ESP_LOGE(TAG, "Failed to get PIN status: %d", err);
+      return;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
 void app_main(void)
 {
   ESP_LOGI(TAG, "BG95 Driver Dev Project Main started ...");
 
-  esp_err_t err;
-
   config_and_init_uart();
   init_bg95();
 
-  // Check SIM card status
-  cpin_read_response_t pin_status = {0};
+  BaseType_t ret = xTaskCreate(
+      conn_to_network_bearer_task, "conn_to_network_bearer_task", 24000, &handle, 2, NULL);
 
-  err = bg95_get_pin_status(&handle, &pin_status);
-  if (err != ESP_OK)
+  if (ret != pdPASS)
   {
-    ESP_LOGE(TAG, "Failed to get PIN status: %d", err);
+    ESP_LOGE(TAG, "ERROR creating conn to network bearer task failed");
     return;
   }
 }

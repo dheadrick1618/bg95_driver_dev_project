@@ -1,5 +1,4 @@
 #include "bg95_driver.h"
-#include "freertos/idf_additions.h"
 #include "freertos/projdefs.h"
 
 #include <esp_err.h>
@@ -14,16 +13,15 @@ static bg95_handle_t handle = {0};
 
 static void config_and_init_uart(void)
 {
-
   bg95_uart_config_t uart_config = {.tx_gpio_num = 32, .rx_gpio_num = 33, .port_num = 2};
 
   esp_err_t err = bg95_uart_interface_init_hw(&uart, uart_config);
 
-  ESP_LOGI(TAG,
-           "UART interface check - write: %p, read: %p, context: %p",
-           uart.write,
-           uart.read,
-           uart.context);
+  // ESP_LOGI(TAG,
+  //          "UART interface check - write: %p, read: %p, context: %p",
+  //          uart.write,
+  //          uart.read,
+  //          uart.context);
 
   if (err != ESP_OK)
   {
@@ -37,7 +35,7 @@ static void config_and_init_uart(void)
     return;
   }
 
-  // // Run loopback test
+  // LOOPBACK TEST - for verifying hardware UART port and pins working
   // err = bg95_uart_interface_loopback_test(&uart);
   // if (err != ESP_OK) {
   //     ESP_LOGE(TAG, "Loopback test failed - check your UART connections");
@@ -65,14 +63,33 @@ static void conn_to_network_bearer_task(void* pvParams)
   for (;;)
   {
     // Check SIM card status
-    cpin_read_response_t pin_status = {0};
+    // -----------------------------------------------------------
+    // cpin_read_response_t pin_status = {0};
+    //
+    // err = bg95_get_pin_status(handle, &pin_status);
+    // if (err != ESP_OK)
+    // {
+    //   ESP_LOGE(TAG, "Failed to get PIN status: %d", err);
+    //   return;
+    // }
 
-    err = bg95_get_pin_status(handle, &pin_status);
-    if (err != ESP_OK)
-    {
-      ESP_LOGE(TAG, "Failed to get PIN status: %d", err);
-      return;
-    }
+    // Check signal quality (AT+CSQ)
+    // -----------------------------------------------------------
+
+    // Check available operators list (AT+COPS)
+    // -----------------------------------------------------------
+
+    // Define PDP context with your carriers APN (AT+CGDCONT)
+    // -----------------------------------------------------------
+
+    // Activate PDP context (AT+CGACT)
+    // -----------------------------------------------------------
+
+    // Verify IP address assignment (AT+CGPADDR)
+    // -----------------------------------------------------------
+
+    // Check network registration status (AT+CREG)
+    // -----------------------------------------------------------
 
     vTaskDelay(pdMS_TO_TICKS(1000));
   }

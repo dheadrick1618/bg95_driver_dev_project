@@ -54,9 +54,11 @@ static void init_bg95(void)
   }
 }
 
+// TODO:  Eventually this will be its own fxn in the BG95 API and will handle all these nested AT
+// cmd operations
 static void conn_to_network_bearer_task(void* pvParams)
 {
-  bg95_handle_t* handle = (bg95_handle_t*) pvParams;
+  bg95_handle_t* bg95_handle = (bg95_handle_t*) pvParams;
 
   esp_err_t err;
 
@@ -64,17 +66,23 @@ static void conn_to_network_bearer_task(void* pvParams)
   {
     // Check SIM card status
     // -----------------------------------------------------------
-    // cpin_read_response_t pin_status = {0};
-    //
-    // err = bg95_get_pin_status(handle, &pin_status);
-    // if (err != ESP_OK)
-    // {
-    //   ESP_LOGE(TAG, "Failed to get PIN status: %d", err);
-    //   return;
-    // }
+    cpin_status_t sim_card_status;
+    err = bg95_get_sim_card_status(bg95_handle, &sim_card_status);
+    if (err != ESP_OK)
+    {
+      ESP_LOGE(TAG, "Failed to get PIN status: %d", err);
+      return;
+    }
 
     // Check signal quality (AT+CSQ)
     // -----------------------------------------------------------
+    int16_t rssi_dbm;
+    err = bg95_get_signal_quality_dbm(bg95_handle, &rssi_dbm);
+    if (err != ESP_OK)
+    {
+      ESP_LOGE(TAG, "Failed to check signal quality: %d", err);
+      return;
+    }
 
     // Check available operators list (AT+COPS)
     // -----------------------------------------------------------

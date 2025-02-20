@@ -7,6 +7,7 @@ idf_component_register(
 	"test_at_cmd_handler.c"
 	#### INDIVIDUAL AT CMD TESTING NOW #### 
 	"test_at_cmd_cpin.c"
+	"test_at_cmd_csq.c"
 	INCLUDE_DIRS
 	"."
 	REQUIRES

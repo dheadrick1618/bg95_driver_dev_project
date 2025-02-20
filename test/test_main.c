@@ -3,15 +3,12 @@
 #include <stdio.h> //For printf
 #include <unity.h>
 
-void run_test_dummy(void);
-
+// void run_test_dummy(void);
 void run_test_at_cmd_parser_all(void);
-
 void run_test_mock_uart_interface_all(void);
-
 void run_test_at_cmd_handler_all(void);
-
 void run_test_at_cmd_cpin_all(void);
+void run_test_at_cmd_csq_all(void);
 
 void app_main(void)
 {
@@ -33,6 +30,9 @@ void app_main(void)
   printf("\n===[[[[[==<<== AT CMD TESTS ==>>==]]]]]===\n");
   printf("\n===< AT CMD: CPIN Tests >===\n");
   run_test_at_cmd_cpin_all();
+
+  printf("\n===< AT CMD: CSQ Tests >===\n");
+  run_test_at_cmd_csq_all();
 
   // UNITY_END(); -- not needed here because each 'run_test_....' fxn handles UNITY BEGIN and END
 }

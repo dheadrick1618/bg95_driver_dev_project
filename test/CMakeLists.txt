@@ -5,6 +5,8 @@ idf_component_register(
 	"test_at_cmd_parser.c"
 	"test_mock_uart_interface.c"
 	"test_at_cmd_handler.c"
+	#### INDIVIDUAL AT CMD TESTING NOW #### 
+	"test_at_cmd_cpin.c"
 	INCLUDE_DIRS
 	"."
 	REQUIRES

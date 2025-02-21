@@ -1,3 +1,4 @@
+#include "at_cmd_cops.h"
 #include "bg95_driver.h"
 #include "freertos/projdefs.h"
 
@@ -71,7 +72,7 @@ static void conn_to_network_bearer_task(void* pvParams)
     if (err != ESP_OK)
     {
       ESP_LOGE(TAG, "Failed to get PIN status: %d", err);
-      return;
+      // return;
     }
 
     // Check signal quality (AT+CSQ)
@@ -81,11 +82,18 @@ static void conn_to_network_bearer_task(void* pvParams)
     if (err != ESP_OK)
     {
       ESP_LOGE(TAG, "Failed to check signal quality: %d", err);
-      return;
+      // return;
     }
 
     // Check available operators list (AT+COPS)
     // -----------------------------------------------------------
+    cops_operator_data_t operator_data;
+    err = bg95_get_current_operator(bg95_handle, &operator_data);
+    if (err != ESP_OK)
+    {
+      ESP_LOGE(TAG, "Failed to get current operator");
+      // return;
+    }
 
     // Define PDP context with your carriers APN (AT+CGDCONT)
     // -----------------------------------------------------------

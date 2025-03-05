@@ -9,11 +9,13 @@ idf_component_register(
 	"test_at_cmd_cpin.c"
 	"test_at_cmd_csq.c"
 	"test_at_cmd_cops.c"
+	"test_at_cmd_cgdcont.c"
 	INCLUDE_DIRS
 	"."
 	REQUIRES
 	unity
 	freertos
 	bg95_driver
+	espcoredump
 )
 

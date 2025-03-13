@@ -17,6 +17,7 @@ void run_test_at_cmd_cpin_all(void);
 void run_test_at_cmd_csq_all(void);
 void run_test_at_cmd_cops_all(void);
 void run_test_at_cmd_cgdcont_all(void);
+void run_test_at_cmd_qmtcfg_all(void);
 
 /* Define test suite information */
 typedef struct
@@ -33,7 +34,9 @@ static const test_suite_t test_suites[] = {
     {"AT CMD: CPIN Tests", run_test_at_cmd_cpin_all},
     {"AT CMD: CSQ Tests", run_test_at_cmd_csq_all},
     {"AT CMD: COPS Tests", run_test_at_cmd_cops_all},
-    {"AT CMD: CGDCONT Tests", run_test_at_cmd_cgdcont_all}};
+    {"AT CMD: CGDCONT Tests", run_test_at_cmd_cgdcont_all},
+    {"AT CMD: QMTCFG Tests", run_test_at_cmd_qmtcfg_all},
+};
 
 #define NUM_TEST_SUITES (sizeof(test_suites) / sizeof(test_suite_t))
 #define TEST_TASK_STACK_SIZE (8192) /* Generous stack size */

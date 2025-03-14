@@ -11,6 +11,10 @@ idf_component_register(
 	"test_at_cmd_cops.c"
 	"test_at_cmd_cgdcont.c"
 	"test_at_cmd_qmtcfg.c"
+	"test_at_cmd_qmtopen.c"
+	"test_at_cmd_qmtclose.c"
+	"test_at_cmd_qmtconn.c"
+	"test_at_cmd_qmtdisc.c"
 	INCLUDE_DIRS
 	"."
 	REQUIRES

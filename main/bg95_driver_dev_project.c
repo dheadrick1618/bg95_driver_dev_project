@@ -101,7 +101,7 @@ static void connect_to_cell_network_task(void* pvParams)
     {
       // loop until successfully able to check mqtt connection status
       // No response means no mqtt connection open, thus we should try and open a connection
-      const char*              host_name        = "dummy.hostname.here";
+      const char*              host_name        = "ravn.aws.thinger.io";
       uint16_t                 port             = 1883; // 1883 is standard port for non SSL MQTT
       qmtopen_write_response_t qmtopen_response = {0};
       err =
@@ -126,9 +126,9 @@ static void connect_to_cell_network_task(void* pvParams)
 
     if (qmtconn_read_response.state != QMTCONN_STATE_CONNECTED)
     {
-      const char*              mqtt_client_id_str     = "dummy_mqtt_client";
-      const char*              mqtt_client_username   = "dummy_mqtt_username";
-      const char*              mqtt_client_password   = "dummy_mqtt_password";
+      const char*              mqtt_client_id_str     = "facptd_1";
+      const char*              mqtt_client_username   = "devin";
+      const char*              mqtt_client_password   = "facptd_1";
       qmtconn_write_response_t qmtconn_write_response = {0};
       err                                             = bg95_mqtt_connect(bg95_handle,
                               mqtt_client_idx,
@@ -140,9 +140,6 @@ static void connect_to_cell_network_task(void* pvParams)
 
     qmtdisc_write_response_t qmtdisc_write_response = {0};
     err = bg95_mqtt_disconnect(bg95_handle, mqtt_client_idx, &qmtdisc_write_response);
-
-    qmtclose_write_response_t qmtclose_response = {0};
-    err = bg95_mqtt_close_network(bg95_handle, mqtt_client_idx, &qmtclose_response);
 
     /////////
 

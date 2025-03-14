@@ -30,7 +30,7 @@ typedef struct
   void (*test_function)(void);
 } test_suite_t;
 
-/* Array of all test suites */
+// /* Array of all test suites */
 static const test_suite_t test_suites[] = {
     {"AT CMD PARSER Tests", run_test_at_cmd_parser_all},
     {"MOCK UART Interface Tests", run_test_mock_uart_interface_all},
@@ -41,9 +41,9 @@ static const test_suite_t test_suites[] = {
     {"AT CMD: CGDCONT Tests", run_test_at_cmd_cgdcont_all},
     {"AT CMD: QMTCFG Tests", run_test_at_cmd_qmtcfg_all},
     {"AT CMD: QMTOPEN Tests", run_test_at_cmd_qmtopen_all},
-    {"AT CMD: QMTOPEN Tests", run_test_at_cmd_qmtclose_all},
-    {"AT CMD: QMTOPEN Tests", run_test_at_cmd_qmtconn_all},
-    {"AT CMD: QMTOPEN Tests", run_test_at_cmd_qmtdisc_all},
+    {"AT CMD: QMTCLOSE Tests", run_test_at_cmd_qmtclose_all},
+    {"AT CMD: QMTCONN Tests", run_test_at_cmd_qmtconn_all},
+    {"AT CMD: QMTDISC Tests", run_test_at_cmd_qmtdisc_all},
 };
 
 #define NUM_TEST_SUITES (sizeof(test_suites) / sizeof(test_suite_t))

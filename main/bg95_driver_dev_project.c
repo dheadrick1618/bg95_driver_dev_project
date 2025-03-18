@@ -5,35 +5,48 @@
 #include "at_cmd_qmtconn.h"
 #include "at_cmd_qmtdisc.h"
 #include "at_cmd_qmtopen.h"
+#include "at_cmd_qmtpub.h"
 #include "bg95_driver.h"
 #include "freertos/projdefs.h"
 
 #include <esp_err.h>
 #include <esp_log.h>
 #include <stdio.h>
+#include <stdlib.h> // For rand()
 #include <string.h>
 
 static const char* TAG = "Main";
 
-static bg95_uart_interface_t uart = {0};
+// static global references to UART and BG95 handles used as Singletons
+static bg95_uart_interface_t uart   = {0};
+static bg95_handle_t         handle = {0};
 
-static bg95_handle_t handle = {0};
+#define UART_TX_GPIO 32
+#define UART_RX_GPIO 33
+#define UART_PORT_NUM 2
+
+// MQTT Configuration Parameters
+#define MQTT_CLIENT_IDX 0 // Use client index 0
+#define MQTT_BROKER_HOST "host.name.here.io"
+#define MQTT_BROKER_PORT 1883 // Standard MQTT port
+#define MQTT_CLIENT_ID "client_id"
+#define MQTT_USERNAME "client_username"
+#define MQTT_PASSWORD "broker_client_password"
+#define MQTT_PUBLISH_TOPIC "topic_name_here"
+#define MQTT_PUBLISH_QOS QMTPUB_QOS_AT_LEAST_ONCE
+#define MQTT_PUBLISH_RETAIN QMTPUB_RETAIN_DISABLED
+#define MQTT_PUBLISH_MSGID 1 // Message ID (used for QoS > 0)
 
 static void config_and_init_uart(void)
 {
-  bg95_uart_config_t uart_config = {.tx_gpio_num = 32, .rx_gpio_num = 33, .port_num = 2};
+  bg95_uart_config_t uart_config = {
+      .tx_gpio_num = UART_TX_GPIO, .rx_gpio_num = UART_RX_GPIO, .port_num = UART_PORT_NUM};
 
   esp_err_t err = bg95_uart_interface_init_hw(&uart, uart_config);
 
-  // ESP_LOGI(TAG,
-  //          "UART interface check - write: %p, read: %p, context: %p",
-  //          uart.write,
-  //          uart.read,
-  //          uart.context);
-
   if (err != ESP_OK)
   {
-    ESP_LOGE(TAG, "Failed to init UART: %d", err);
+    ESP_LOGE(TAG, "Failed to init UART: %s", esp_err_to_name(err));
     return;
   }
 
@@ -42,18 +55,10 @@ static void config_and_init_uart(void)
     ESP_LOGE(TAG, "UART functions not properly initialized");
     return;
   }
-
-  // LOOPBACK TEST - for verifying hardware UART port and pins working
-  // err = bg95_uart_interface_loopback_test(&uart);
-  // if (err != ESP_OK) {
-  //     ESP_LOGE(TAG, "Loopback test failed - check your UART connections");
-  //     return;
-  // }
 }
 
 static void init_bg95(void)
 {
-
   ESP_LOGI(TAG, "Initializing BG95 driver");
   esp_err_t err = bg95_init(&handle, &uart);
   if (err != ESP_OK)
@@ -62,1018 +67,291 @@ static void init_bg95(void)
   }
 }
 
-// TODO:  Eventually this will be its own fxn in the BG95 API and will handle all these nested AT
-// cmd operations
-static void connect_to_cell_network_task(void* pvParams)
+// This function demonstrates how to publish a message via MQTT
+static esp_err_t publish_mqtt_message(bg95_handle_t* bg95_handle, const char* message)
+{
+  esp_err_t err;
+
+  if (!bg95_handle->initialized)
+  {
+    ESP_LOGE(TAG, "BG95 driver not initialized");
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  ESP_LOGI(TAG, "Publishing message to topic '%s': %s", MQTT_PUBLISH_TOPIC, message);
+  qmtpub_write_response_t pub_response = {0};
+
+  err = bg95_mqtt_publish_fixed_length(bg95_handle,
+                                       MQTT_CLIENT_IDX,
+                                       MQTT_PUBLISH_MSGID,
+                                       MQTT_PUBLISH_QOS,
+                                       MQTT_PUBLISH_RETAIN,
+                                       MQTT_PUBLISH_TOPIC,
+                                       message,
+                                       strlen(message),
+                                       &pub_response);
+
+  if (err != ESP_OK)
+  {
+    ESP_LOGE(TAG, "Failed to publish MQTT message: %s", esp_err_to_name(err));
+    return err;
+  }
+
+  // Check the immediate response if available
+  if (pub_response.present.has_result)
+  {
+    if (pub_response.result == QMTPUB_RESULT_SUCCESS)
+    {
+      ESP_LOGI(TAG, "Message published successfully!");
+    }
+    else
+    {
+      ESP_LOGW(TAG,
+               "Message publication in progress, result: %s",
+               enum_to_str(pub_response.result, QMTPUB_RESULT_MAP, QMTPUB_RESULT_MAP_SIZE));
+
+      // For retransmission we might have a value
+      if (pub_response.result == QMTPUB_RESULT_RETRANSMISSION && pub_response.present.has_value)
+      {
+        ESP_LOGW(TAG, "Retransmission count: %d", pub_response.value);
+      }
+    }
+  }
+  else
+  {
+    ESP_LOGI(TAG, "Message publication initiated, waiting for result...");
+    // In a real application, you would handle the URC asynchronously
+  }
+
+  return ESP_OK;
+}
+
+static void connect_and_publish_task(void* pvParams)
 {
   bg95_handle_t* bg95_handle = (bg95_handle_t*) pvParams;
   esp_err_t      err;
   int            cid             = 1;
-  int            mqtt_client_idx = 0;
+  int            mqtt_client_idx = MQTT_CLIENT_IDX;
+  int            msg_count       = 0;
+  char           message_buffer[128];
 
+// Define variables for subscription
+#define MQTT_SUBSCRIBE_TOPIC "testbucket1/response"
+#define MQTT_SUBSCRIBE_QOS QMTSUB_QOS_AT_LEAST_ONCE
+#define MQTT_SUBSCRIBE_MSGID 2 // Different from publish msgid
+#define MQTT_UNSUBSCRIBE_MSGID 3
+
+  // Main connection and publishing loop
   for (;;)
   {
-
-    // check if connected already, if it is, then skip network connection attempt
+    // 1. Check if already connected to the network
     bool is_pdp_context_active = false;
     err = bg95_is_pdp_context_active(bg95_handle, cid, &is_pdp_context_active);
-    if (err != ESP_OK)
+    if (err != ESP_OK || !is_pdp_context_active)
     {
-      // loop until connected to network
-      continue;
-    }
-
-    if (is_pdp_context_active == false)
-    {
+      ESP_LOGI(TAG, "PDP context not active, connecting to network...");
       err = bg95_connect_to_network(bg95_handle);
       if (err != ESP_OK)
       {
-        // loop until connected to network
+        ESP_LOGE(TAG, "Failed to connect to network: %s", esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(5000)); // Wait before retrying
         continue;
       }
+
+      ESP_LOGI(TAG, "Successfully connected to cellular network");
+      // Wait a bit for connection to stabilize
+      vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
-    // check if connection is OPEN to mqtt broker already, if it is, then skip mqtt connection OPEN
-    // attempt
-    qmtopen_read_response_t response_status = {0};
-    err = bg95_mqtt_network_open_status(bg95_handle, mqtt_client_idx, &response_status);
+    // 2. Check if MQTT network connection is open
+    qmtopen_read_response_t open_status = {0};
+    err = bg95_mqtt_network_open_status(bg95_handle, mqtt_client_idx, &open_status);
+
     if (err != ESP_OK)
     {
-      // loop until successfully able to check mqtt connection status
-      // No response means no mqtt connection open, thus we should try and open a connection
-      const char*              host_name        = "ravn.aws.thinger.io";
-      uint16_t                 port             = 1883; // 1883 is standard port for non SSL MQTT
+      ESP_LOGI(
+          TAG, "Opening MQTT network connection to %s:%d...", MQTT_BROKER_HOST, MQTT_BROKER_PORT);
       qmtopen_write_response_t qmtopen_response = {0};
-      err =
-          bg95_mqtt_open_network(bg95_handle, mqtt_client_idx, host_name, port, &qmtopen_response);
+
+      err = bg95_mqtt_open_network(
+          bg95_handle, mqtt_client_idx, MQTT_BROKER_HOST, MQTT_BROKER_PORT, &qmtopen_response);
       if (err != ESP_OK)
       {
-        // loop until able to form connection
+        ESP_LOGE(TAG, "Failed to open MQTT network connection: %s", esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(5000));
         continue;
       }
+
+      ESP_LOGI(TAG, "MQTT network connection request sent");
+      // Wait for connection to establish
+      vTaskDelay(pdMS_TO_TICKS(2000));
     }
-    vTaskDelay(pdMS_TO_TICKS(500));
 
-    // Check if mqtt client is CONNECTED already, if it is, then skip client connection attempt
-
+    // 3. Check if client is connected to the MQTT broker
     qmtconn_read_response_t qmtconn_read_response = {0};
     err = bg95_mqtt_query_connection_state(bg95_handle, mqtt_client_idx, &qmtconn_read_response);
+
+    if (err != ESP_OK || qmtconn_read_response.state != QMTCONN_STATE_CONNECTED)
+    {
+      ESP_LOGI(TAG, "Connecting to MQTT broker with client ID '%s'...", MQTT_CLIENT_ID);
+      qmtconn_write_response_t qmtconn_write_response = {0};
+
+      err = bg95_mqtt_connect(bg95_handle,
+                              mqtt_client_idx,
+                              MQTT_CLIENT_ID,
+                              MQTT_USERNAME,
+                              MQTT_PASSWORD,
+                              &qmtconn_write_response);
+
+      if (err != ESP_OK)
+      {
+        ESP_LOGE(TAG, "Failed to connect to MQTT broker: %s", esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        continue;
+      }
+
+      ESP_LOGI(TAG, "MQTT connection request sent");
+      // Wait for connection to establish
+      vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+
+    // 4. Subscribe to a topic for receiving responses (NEW FUNCTIONALITY)
+    ESP_LOGI(TAG,
+             "Subscribing to MQTT topic '%s' with QoS %d...",
+             MQTT_SUBSCRIBE_TOPIC,
+             MQTT_SUBSCRIBE_QOS);
+
+    qmtsub_write_response_t sub_response = {0};
+    err                                  = bg95_mqtt_subscribe(bg95_handle,
+                              mqtt_client_idx,
+                              MQTT_SUBSCRIBE_MSGID,
+                              MQTT_SUBSCRIBE_TOPIC,
+                              MQTT_SUBSCRIBE_QOS,
+                              &sub_response);
+
     if (err != ESP_OK)
     {
-      // loop until able to successfully check connection state
-      continue;
+      ESP_LOGE(TAG, "Failed to subscribe to topic: %s", esp_err_to_name(err));
     }
-
-    if (qmtconn_read_response.state != QMTCONN_STATE_CONNECTED)
+    else if (sub_response.present.has_result)
     {
-      const char*              mqtt_client_id_str     = "facptd_1";
-      const char*              mqtt_client_username   = "devin";
-      const char*              mqtt_client_password   = "facptd_1";
-      qmtconn_write_response_t qmtconn_write_response = {0};
-      err                                             = bg95_mqtt_connect(bg95_handle,
-                              mqtt_client_idx,
-                              mqtt_client_id_str,
-                              mqtt_client_username,
-                              mqtt_client_password,
-                              &qmtconn_write_response);
+      if (sub_response.result == QMTSUB_RESULT_SUCCESS)
+      {
+        ESP_LOGI(TAG, "Successfully subscribed to topic '%s'", MQTT_SUBSCRIBE_TOPIC);
+        if (sub_response.present.has_value)
+        {
+          ESP_LOGI(TAG, "Granted QoS: %d", sub_response.value);
+        }
+      }
+      else
+      {
+        ESP_LOGW(TAG,
+                 "Subscription in progress, result: %s",
+                 enum_to_str(sub_response.result, QMTSUB_RESULT_MAP, QMTSUB_RESULT_MAP_SIZE));
+      }
+    }
+    else
+    {
+      ESP_LOGI(TAG, "Subscription request sent, waiting for result...");
     }
 
+    // Wait a bit after subscription
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    // 5. Now that we have a connection, let's publish some messages
+    for (int i = 0; i < 3; i++)
+    { // Publish 3 messages per connection cycle
+      // Create a sample message with incrementing counter
+      snprintf(message_buffer,
+               sizeof(message_buffer),
+               "{\"device_id\":\"%s\",\"sequence\":%d,\"temperature\":%.1f,\"humidity\":%.1f}",
+               MQTT_CLIENT_ID,
+               msg_count++,
+               25.5 + (float) (rand() % 10) / 10.0f,  // Random temperature data
+               45.0 + (float) (rand() % 20) / 10.0f); // Random humidity data
+
+      // Publish the message
+      err = publish_mqtt_message(bg95_handle, message_buffer);
+      if (err != ESP_OK)
+      {
+        ESP_LOGE(TAG, "Failed to publish message: %s", esp_err_to_name(err));
+        break; // Exit the publishing loop on error
+      }
+
+      // Wait between publications
+      vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+
+    // 6. Unsubscribe from the topic before disconnecting
+    ESP_LOGI(TAG, "Unsubscribing from MQTT topic '%s'...", MQTT_SUBSCRIBE_TOPIC);
+
+    qmtuns_write_response_t unsub_response = {0};
+    err                                    = bg95_mqtt_unsubscribe(bg95_handle,
+                                mqtt_client_idx,
+                                MQTT_UNSUBSCRIBE_MSGID,
+                                MQTT_SUBSCRIBE_TOPIC,
+                                &unsub_response);
+
+    if (err != ESP_OK)
+    {
+      ESP_LOGE(TAG, "Failed to unsubscribe from topic: %s", esp_err_to_name(err));
+    }
+    else if (unsub_response.present.has_result)
+    {
+      if (unsub_response.result == QMTUNS_RESULT_SUCCESS)
+      {
+        ESP_LOGI(TAG, "Successfully unsubscribed from topic '%s'", MQTT_SUBSCRIBE_TOPIC);
+      }
+      else
+      {
+        ESP_LOGW(TAG,
+                 "Unsubscription in progress, result: %s",
+                 enum_to_str(unsub_response.result, QMTUNS_RESULT_MAP, QMTUNS_RESULT_MAP_SIZE));
+      }
+    }
+    else
+    {
+      ESP_LOGI(TAG, "Unsubscription request sent, waiting for result...");
+    }
+
+    // Wait a bit after unsubscription
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    // 7. Disconnect MQTT (will reconnect on next loop iteration)
     qmtdisc_write_response_t qmtdisc_write_response = {0};
     err = bg95_mqtt_disconnect(bg95_handle, mqtt_client_idx, &qmtdisc_write_response);
-
-    /////////
-
-    if (err == ESP_OK)
+    if (err != ESP_OK)
     {
-      vTaskDelete(NULL);
+      ESP_LOGE(TAG, "Failed to disconnect from MQTT broker: %s", esp_err_to_name(err));
     }
-    vTaskDelay(1000);
+    else
+    {
+      ESP_LOGI(TAG, "Successfully disconnected from MQTT broker");
+    }
 
-    // // Check SIM card status
-    // // -----------------------------------------------------------
-    // cpin_status_t sim_card_status;
-    // err = bg95_get_sim_card_status(bg95_handle, &sim_card_status);
-    // if (err != ESP_OK)
-    // {
-    //   ESP_LOGE(TAG, "Failed to get PIN status: %d", err);
-    //   // return;
-    // }
-    //
-    // // Check signal quality (AT+CSQ)
-    // // -----------------------------------------------------------
-    // int16_t rssi_dbm;
-    // err = bg95_get_signal_quality_dbm(bg95_handle, &rssi_dbm);
-    // if (err != ESP_OK)
-    // {
-    //   ESP_LOGE(TAG, "Failed to check signal quality: %d", err);
-    //   // return;
-    // }
-    //
-    // // Check available operators list (AT+COPS)
-    // // -----------------------------------------------------------
-    // cops_operator_data_t operator_data;
-    // err = bg95_get_current_operator(bg95_handle, &operator_data);
-    // if (err != ESP_OK)
-    // {
-    //   ESP_LOGE(TAG, "Failed to get current operator");
-    //   // return;
-    // }
-    //
-    // // First check if PDP context is already active
-    // // -----------------------------------------------------------
-    // uint8_t cid       = 1; // Use context ID 1
-    // bool    is_active = false;
-    // err               = bg95_is_pdp_context_active(bg95_handle, cid, &is_active);
-    //
-    // if (err == ESP_OK)
-    // {
-    //   if (is_active)
-    //   {
-    //     ESP_LOGI(TAG, "PDP context %d is already active", cid);
-    //
-    //     // Since context is already active, get its IP address
-    //     char ip_address[CGPADDR_ADDRESS_MAX_CHARS];
-    //     err = bg95_get_pdp_address_for_cid(bg95_handle, cid, ip_address, sizeof(ip_address));
-    //
-    //     if (err == ESP_OK)
-    //     {
-    //       ESP_LOGI(TAG, "PDP context %d has IP address: %s", cid, ip_address);
-    //       // Context is active and has IP - we're good to go for network operations
-    //     }
-    //     else
-    //     {
-    //       ESP_LOGW(
-    //           TAG, "Failed to get IP address for active context %d: %s", cid,
-    //           esp_err_to_name(err));
-    //     }
-    //   }
-    //   else
-    //   {
-    //     ESP_LOGI(TAG, "PDP context %d is not active, proceeding with setup", cid);
-    //
-    //     // Define PDP context with your carrier's APN (AT+CGDCONT)
-    //     // -----------------------------------------------------------
-    //     cgdcont_pdp_type_t pdp_type = CGDCONT_PDP_TYPE_IP; // Use IP type
-    //     const char*        apn      = "simbase";           // Use 'simbase' as the APN
-    //
-    //     err = bg95_define_pdp_context(bg95_handle, cid, pdp_type, apn);
-    //     if (err != ESP_OK)
-    //     {
-    //       ESP_LOGE(TAG, "Failed to define PDP context: %d", err);
-    //       // Don't return, continue with other operations
-    //     }
-    //     else
-    //     {
-    //       ESP_LOGI(TAG, "Successfully defined PDP context with APN: %s", apn);
-    //
-    //       // SOFT RESET now to implement the defined PDP context and APN
-    //       err = bg95_soft_restart(bg95_handle);
-    //       if (err != ESP_OK)
-    //       {
-    //         ESP_LOGE(TAG, "Failed to soft restart BG95 %d", err);
-    //         // Don't return, continue with other operations
-    //       }
-    //       else
-    //       {
-    //         ESP_LOGI(TAG, "Successfully soft restarted BG95");
-    //
-    //         // Activate PDP context (AT+CGACT)
-    //         // -----------------------------------------------------------
-    //         err = bg95_activate_pdp_context(bg95_handle, cid);
-    //         if (err != ESP_OK)
-    //         {
-    //           ESP_LOGE(TAG,
-    //                    "Failed to activate PDP context for cid: %d, error: %s",
-    //                    cid,
-    //                    esp_err_to_name(err));
-    //         }
-    //         else
-    //         {
-    //           ESP_LOGI(TAG, "Successfully Activated PDP context for CID: %d", cid);
-    //
-    //           // Verify IP address assignment (AT+CGPADDR)
-    //           // -----------------------------------------------------------
-    //           char ip_address[CGPADDR_ADDRESS_MAX_CHARS];
-    //           err = bg95_get_pdp_address_for_cid(bg95_handle, cid, ip_address,
-    //           sizeof(ip_address));
-    //
-    //           if (err == ESP_OK)
-    //           {
-    //             ESP_LOGI(TAG, "PDP context %d assigned IP address: %s", cid, ip_address);
-    //             // Now that we have an IP address, we could proceed with network operations
-    //           }
-    //           else
-    //           {
-    //             ESP_LOGW(
-    //                 TAG, "Failed to get IP address after activation: %s", esp_err_to_name(err));
-    //             // Activation seemed successful but no IP address - may need to retry or check
-    //             // network
-    //           }
-    //         }
-    //       }
-    //     }
-    //   }
-    // }
-    // else
-    // {
-    //   ESP_LOGE(TAG, "Failed to check PDP context status: %s", esp_err_to_name(err));
-    // }
-
-    // qmtcfg_test_response_t config_params = {0};
-    // err                                  = bg95_get_mqtt_config_params(bg95_handle,
-    // &config_params);
-
-    // err = bg95_mqtt_config_set_pdp_context(bg95_handle, 0, 1);
-    // if (err != ESP_OK)
-    // {
-    //   ESP_LOGE(TAG, "Failed to set and query MQTT PDP context: %s", esp_err_to_name(err));
-    //   return;
-    // }
-    //
-    // // Create a response structure to hold the query results
-    // qmtcfg_write_pdpcid_response_t pdp_response = {0};
-    //
-    // // Query the PDP context for MQTT client index 0
-    // esp_err_t err = bg95_mqtt_config_query_pdp_context(bg95_handle, 0, &pdp_response);
-    //
-    // if (err != ESP_OK)
-    // {
-    //   ESP_LOGE(TAG, "Failed to query MQTT PDP context: %s", esp_err_to_name(err));
-    //   return;
-    // }
-    //
-    // ESP_LOGI(TAG, "--------- TESTING MQTT SSL CONFIGURATION ---------");
-    //
-    // // First, query the current SSL configuration
-    // qmtcfg_write_ssl_response_t ssl_response = {0};
-    // err = bg95_mqtt_config_query_ssl(bg95_handle, 0, &ssl_response);
-    //
-    // if (err != ESP_OK)
-    // {
-    //   ESP_LOGE(TAG, "Failed to query MQTT SSL configuration: %s", esp_err_to_name(err));
-    //   return;
-    // }
-    //
-    // // Display current configuration
-    // if (ssl_response.present.has_ssl_enable)
-    // {
-    //   ESP_LOGI(TAG,
-    //            "Current MQTT SSL mode: %s",
-    //            ssl_response.ssl_enable == QMTCFG_SSL_ENABLE ? "Enabled" : "Disabled");
-    //
-    //   if (ssl_response.present.has_ctx_index && ssl_response.ssl_enable == QMTCFG_SSL_ENABLE)
-    //   {
-    //     ESP_LOGI(TAG, "Using SSL context index: %d", ssl_response.ctx_index);
-    //   }
-    // }
-    // else
-    // {
-    //   ESP_LOGW(TAG, "No SSL configuration found");
-    // }
-    //
-    // // Now set a new SSL configuration
-    // // For testing, we'll toggle the current configuration
-    // qmtcfg_ssl_mode_t new_ssl_mode =
-    //     (ssl_response.present.has_ssl_enable && ssl_response.ssl_enable == QMTCFG_SSL_ENABLE)
-    //         ? QMTCFG_SSL_DISABLE
-    //         : QMTCFG_SSL_ENABLE;
-    //
-    // uint8_t new_ctx_index = 0; // Default context index
-    // if (ssl_response.present.has_ctx_index)
-    // {
-    //   // Use a different context index for testing
-    //   new_ctx_index = (ssl_response.ctx_index + 1) % 6; // Keep within 0-5 range
-    // }
-    //
-    // ESP_LOGI(TAG,
-    //          "Setting new SSL mode: %s, context index: %d",
-    //          new_ssl_mode == QMTCFG_SSL_ENABLE ? "Enabled" : "Disabled",
-    //          new_ctx_index);
-    //
-    // err = bg95_mqtt_config_set_ssl(bg95_handle, 0, new_ssl_mode, new_ctx_index);
-    //
-    // if (err != ESP_OK)
-    // {
-    //   ESP_LOGE(TAG, "Failed to set MQTT SSL configuration: %s", esp_err_to_name(err));
-    //   return;
-    // }
-    //
-    // // Query again to verify the changes
-    // memset(&ssl_response, 0, sizeof(ssl_response));
-    // err = bg95_mqtt_config_query_ssl(bg95_handle, 0, &ssl_response);
-    //
-    // if (err != ESP_OK)
-    // {
-    //   ESP_LOGE(
-    //       TAG, "Failed to query MQTT SSL configuration after update: %s", esp_err_to_name(err));
-    //   return;
-    // }
-    //
-    // // Verify the new configuration
-    // if (ssl_response.present.has_ssl_enable)
-    // {
-    //   ESP_LOGI(TAG,
-    //            "Updated MQTT SSL mode: %s",
-    //            ssl_response.ssl_enable == QMTCFG_SSL_ENABLE ? "Enabled" : "Disabled");
-    //
-    //   if (ssl_response.present.has_ctx_index && ssl_response.ssl_enable == QMTCFG_SSL_ENABLE)
-    //   {
-    //     ESP_LOGI(TAG, "Using SSL context index: %d", ssl_response.ctx_index);
-    //   }
-    //
-    //   // Verify if the new values match what we set
-    //   if (ssl_response.ssl_enable == new_ssl_mode)
-    //   {
-    //     ESP_LOGI(TAG, "SSL mode successfully updated!");
-    //   }
-    //   else
-    //   {
-    //     ESP_LOGW(TAG, "SSL mode doesn't match the requested value");
-    //   }
-    //
-    //   if (ssl_response.present.has_ctx_index && ssl_response.ssl_enable == QMTCFG_SSL_ENABLE &&
-    //       ssl_response.ctx_index == new_ctx_index)
-    //   {
-    //     ESP_LOGI(TAG, "SSL context index successfully updated!");
-    //   }
-    //   else if (ssl_response.ssl_enable == QMTCFG_SSL_ENABLE)
-    //   {
-    //     ESP_LOGW(TAG, "SSL context index doesn't match the requested value");
-    //   }
-    // }
-    // else
-    // {
-    //   ESP_LOGW(TAG, "No SSL configuration found after update");
-    // }
-    //
-    // ESP_LOGI(TAG, "--------- MQTT SSL CONFIGURATION TEST COMPLETE ---------");
-    //
-    // ESP_LOGI(TAG, "--------- TESTING MQTT KEEPALIVE CONFIGURATION ---------");
-    //
-    // // First, query the current keepalive configuration
-    // qmtcfg_write_keepalive_response_t keepalive_response = {0};
-    // err = bg95_mqtt_config_query_keepalive(bg95_handle, 0, &keepalive_response);
-    //
-    // if (err != ESP_OK)
-    // {
-    //   ESP_LOGE(TAG, "Failed to query MQTT keepalive configuration: %s", esp_err_to_name(err));
-    //   return;
-    // }
-    //
-    // // Display current configuration
-    // if (keepalive_response.present.has_keep_alive_time)
-    // {
-    //   ESP_LOGI(TAG, "Current MQTT keep-alive time: %d seconds",
-    //   keepalive_response.keep_alive_time);
-    // }
-    // else
-    // {
-    //   ESP_LOGW(TAG, "No keep-alive configuration found");
-    // }
-    //
-    // // Now set a new keepalive configuration
-    // // For testing, we'll use a different value than current
-    // uint16_t current_time = 0;
-    // if (keepalive_response.present.has_keep_alive_time)
-    // {
-    //   current_time = keepalive_response.keep_alive_time;
-    // }
-    //
-    // uint16_t new_keep_alive_time;
-    // if (current_time == 120)
-    // {                            // 120 is the default value
-    //   new_keep_alive_time = 180; // Set to 3 minutes if it was default
-    // }
-    // else
-    // {
-    //   new_keep_alive_time = 120; // Set to default otherwise
-    // }
-    //
-    // ESP_LOGI(TAG, "Setting new keep-alive time: %d seconds", new_keep_alive_time);
-    //
-    // err = bg95_mqtt_config_set_keepalive(bg95_handle, 0, new_keep_alive_time);
-    //
-    // if (err != ESP_OK)
-    // {
-    //   ESP_LOGE(TAG, "Failed to set MQTT keep-alive time: %s", esp_err_to_name(err));
-    //   return;
-    // }
-    //
-    // // Query again to verify the changes
-    // memset(&keepalive_response, 0, sizeof(keepalive_response));
-    // err = bg95_mqtt_config_query_keepalive(bg95_handle, 0, &keepalive_response);
-    //
-    // if (err != ESP_OK)
-    // {
-    //   ESP_LOGE(TAG, "Failed to query MQTT keep-alive time after update: %s",
-    //   esp_err_to_name(err)); return;
-    // }
-    //
-    // // Verify the new configuration
-    // if (keepalive_response.present.has_keep_alive_time)
-    // {
-    //   ESP_LOGI(TAG, "Updated MQTT keep-alive time: %d seconds",
-    //   keepalive_response.keep_alive_time);
-    //
-    //   // Verify if the new values match what we set
-    //   if (keepalive_response.keep_alive_time == new_keep_alive_time)
-    //   {
-    //     ESP_LOGI(TAG, "Keep-alive time successfully updated!");
-    //   }
-    //   else
-    //   {
-    //     ESP_LOGW(TAG,
-    //              "Keep-alive time doesn't match the requested value. "
-    //              "Requested: %d, Got: %d",
-    //              new_keep_alive_time,
-    //              keepalive_response.keep_alive_time);
-    //   }
-    // }
-    // else
-    // {
-    //   ESP_LOGW(TAG, "No keep-alive configuration found after update");
-    // }
-    //
-    // ESP_LOGI(TAG, "--------- MQTT KEEPALIVE CONFIGURATION TEST COMPLETE ---------");
-    //
-    // ESP_LOGI(TAG, "--------- TESTING MQTT TIMEOUT CONFIGURATION ---------");
-    //
-    // // First, query the current timeout configuration
-    // qmtcfg_write_timeout_response_t timeout_response = {0};
-    // err = bg95_mqtt_config_query_timeout(bg95_handle, 0, &timeout_response);
-    //
-    // if (err != ESP_OK)
-    // {
-    //   ESP_LOGE(TAG, "Failed to query MQTT timeout configuration: %s", esp_err_to_name(err));
-    //   return;
-    // }
-    //
-    // // Display current configuration
-    // ESP_LOGI(TAG, "Current MQTT timeout configuration:");
-    //
-    // uint8_t                 current_pkt_timeout    = 5;                             // Default
-    // uint8_t                 current_retry_times    = 3;                             // Default
-    // qmtcfg_timeout_notice_t current_timeout_notice = QMTCFG_TIMEOUT_NOTICE_DISABLE; // Default
-    //
-    // if (timeout_response.present.has_pkt_timeout)
-    // {
-    //   current_pkt_timeout = timeout_response.pkt_timeout;
-    //   ESP_LOGI(TAG, "  Packet timeout: %d seconds", current_pkt_timeout);
-    // }
-    // else
-    // {
-    //   ESP_LOGW(TAG, "  Packet timeout information not available");
-    // }
-    //
-    // if (timeout_response.present.has_retry_times)
-    // {
-    //   current_retry_times = timeout_response.retry_times;
-    //   ESP_LOGI(TAG, "  Retry times: %d", current_retry_times);
-    // }
-    // else
-    // {
-    //   ESP_LOGW(TAG, "  Retry times information not available");
-    // }
-    //
-    // if (timeout_response.present.has_timeout_notice)
-    // {
-    //   current_timeout_notice = timeout_response.timeout_notice;
-    //   ESP_LOGI(TAG,
-    //            "  Timeout notice: %s",
-    //            current_timeout_notice == QMTCFG_TIMEOUT_NOTICE_ENABLE ? "Enabled" : "Disabled");
-    // }
-    // else
-    // {
-    //   ESP_LOGW(TAG, "  Timeout notice information not available");
-    // }
-    //
-    // // Now set new timeout parameters that are different from current values
-    // uint8_t                 new_pkt_timeout = (current_pkt_timeout == 5) ? 10 : 5;
-    // uint8_t                 new_retry_times = (current_retry_times == 3) ? 5 : 3;
-    // qmtcfg_timeout_notice_t new_timeout_notice =
-    //     (current_timeout_notice == QMTCFG_TIMEOUT_NOTICE_ENABLE) ? QMTCFG_TIMEOUT_NOTICE_DISABLE
-    //                                                              : QMTCFG_TIMEOUT_NOTICE_ENABLE;
-    //
-    // ESP_LOGI(TAG, "Setting new timeout parameters:");
-    // ESP_LOGI(TAG, "  Packet timeout: %d seconds", new_pkt_timeout);
-    // ESP_LOGI(TAG, "  Retry times: %d", new_retry_times);
-    // ESP_LOGI(TAG,
-    //          "  Timeout notice: %s",
-    //          new_timeout_notice == QMTCFG_TIMEOUT_NOTICE_ENABLE ? "Enabled" : "Disabled");
-    //
-    // err = bg95_mqtt_config_set_timeout(
-    //     bg95_handle, 0, new_pkt_timeout, new_retry_times, new_timeout_notice);
-    //
-    // if (err != ESP_OK)
-    // {
-    //   ESP_LOGE(TAG, "Failed to set MQTT timeout parameters: %s", esp_err_to_name(err));
-    //   return;
-    // }
-    //
-    // // Query again to verify the changes
-    // memset(&timeout_response, 0, sizeof(timeout_response));
-    // err = bg95_mqtt_config_query_timeout(bg95_handle, 0, &timeout_response);
-    //
-    // if (err != ESP_OK)
-    // {
-    //   ESP_LOGE(
-    //       TAG, "Failed to query MQTT timeout parameters after update: %s", esp_err_to_name(err));
-    //   return;
-    // }
-    //
-    // // Verify the new configuration
-    // ESP_LOGI(TAG, "Updated MQTT timeout configuration:");
-    //
-    // bool all_params_match = true;
-    //
-    // if (timeout_response.present.has_pkt_timeout)
-    // {
-    //   ESP_LOGI(TAG, "  Packet timeout: %d seconds", timeout_response.pkt_timeout);
-    //   if (timeout_response.pkt_timeout != new_pkt_timeout)
-    //   {
-    //     ESP_LOGW(TAG, "  Packet timeout doesn't match the requested value");
-    //     all_params_match = false;
-    //   }
-    // }
-    // else
-    // {
-    //   ESP_LOGW(TAG, "  Packet timeout information not available after update");
-    //   all_params_match = false;
-    // }
-    //
-    // if (timeout_response.present.has_retry_times)
-    // {
-    //   ESP_LOGI(TAG, "  Retry times: %d", timeout_response.retry_times);
-    //   if (timeout_response.retry_times != new_retry_times)
-    //   {
-    //     ESP_LOGW(TAG, "  Retry times doesn't match the requested value");
-    //     all_params_match = false;
-    //   }
-    // }
-    // else
-    // {
-    //   ESP_LOGW(TAG, "  Retry times information not available after update");
-    //   all_params_match = false;
-    // }
-    //
-    // if (timeout_response.present.has_timeout_notice)
-    // {
-    //   ESP_LOGI(TAG,
-    //            "  Timeout notice: %s",
-    //            timeout_response.timeout_notice == QMTCFG_TIMEOUT_NOTICE_ENABLE ? "Enabled"
-    //                                                                            : "Disabled");
-    //   if (timeout_response.timeout_notice != new_timeout_notice)
-    //   {
-    //     ESP_LOGW(TAG, "  Timeout notice doesn't match the requested value");
-    //     all_params_match = false;
-    //   }
-    // }
-    // else
-    // {
-    //   ESP_LOGW(TAG, "  Timeout notice information not available after update");
-    //   all_params_match = false;
-    // }
-    //
-    // if (all_params_match)
-    // {
-    //   ESP_LOGI(TAG, "All timeout parameters successfully updated!");
-    // }
-    // else
-    // {
-    //   ESP_LOGW(TAG, "Some timeout parameters don't match the requested values");
-    // }
-    //
-    // ESP_LOGI(TAG, "--------- MQTT TIMEOUT CONFIGURATION TEST COMPLETE ---------");
-    //
-    // ESP_LOGI(TAG, "--------- TESTING MQTT SESSION CONFIGURATION ---------");
-    //
-    // // First, query the current session configuration
-    // qmtcfg_write_session_response_t session_response = {0};
-    // err = bg95_mqtt_config_query_session(bg95_handle, 0, &session_response);
-    //
-    // if (err != ESP_OK)
-    // {
-    //   ESP_LOGE(TAG, "Failed to query MQTT session configuration: %s", esp_err_to_name(err));
-    //   return;
-    // }
-    //
-    // // Display current configuration
-    // if (session_response.present.has_clean_session)
-    // {
-    //   ESP_LOGI(TAG,
-    //            "Current MQTT session type: %s",
-    //            session_response.clean_session == QMTCFG_CLEAN_SESSION_ENABLE
-    //                ? "Clean (discard information)"
-    //                : "Persistent (store subscriptions)");
-    // }
-    // else
-    // {
-    //   ESP_LOGW(TAG, "No session configuration found");
-    // }
-    //
-    // // Now set a new session configuration
-    // // For testing, we'll toggle the current configuration
-    // qmtcfg_clean_session_t new_clean_session;
-    //
-    // if (session_response.present.has_clean_session)
-    // {
-    //   // Toggle the current setting
-    //   new_clean_session = (session_response.clean_session == QMTCFG_CLEAN_SESSION_ENABLE)
-    //                           ? QMTCFG_CLEAN_SESSION_DISABLE
-    //                           : QMTCFG_CLEAN_SESSION_ENABLE;
-    // }
-    // else
-    // {
-    //   // Default to clean session if current setting is unknown
-    //   new_clean_session = QMTCFG_CLEAN_SESSION_ENABLE;
-    // }
-    //
-    // ESP_LOGI(TAG,
-    //          "Setting new session type: %s",
-    //          new_clean_session == QMTCFG_CLEAN_SESSION_ENABLE ? "Clean (discard information)"
-    //                                                           : "Persistent (store
-    //                                                           subscriptions)");
-    //
-    // err = bg95_mqtt_config_set_session(bg95_handle, 0, new_clean_session);
-    //
-    // if (err != ESP_OK)
-    // {
-    //   ESP_LOGE(TAG, "Failed to set MQTT session type: %s", esp_err_to_name(err));
-    //   return;
-    // }
-    //
-    // // Query again to verify the changes
-    // memset(&session_response, 0, sizeof(session_response));
-    // err = bg95_mqtt_config_query_session(bg95_handle, 0, &session_response);
-    //
-    // if (err != ESP_OK)
-    // {
-    //   ESP_LOGE(TAG, "Failed to query MQTT session type after update: %s", esp_err_to_name(err));
-    //   return;
-    // }
-    //
-    // // Verify the new configuration
-    // if (session_response.present.has_clean_session)
-    // {
-    //   ESP_LOGI(TAG,
-    //            "Updated MQTT session type: %s",
-    //            session_response.clean_session == QMTCFG_CLEAN_SESSION_ENABLE
-    //                ? "Clean (discard information)"
-    //                : "Persistent (store subscriptions)");
-    //
-    //   // Verify if the new value matches what we set
-    //   if (session_response.clean_session == new_clean_session)
-    //   {
-    //     ESP_LOGI(TAG, "Session type successfully updated!");
-    //   }
-    //   else
-    //   {
-    //     ESP_LOGW(TAG, "Session type doesn't match the requested value");
-    //   }
-    // }
-    // else
-    // {
-    //   ESP_LOGW(TAG, "No session configuration found after update");
-    // }
-    //
-    // ESP_LOGI(TAG, "--------- MQTT SESSION CONFIGURATION TEST COMPLETE ---------");
-    //
-    // ESP_LOGI(TAG, "--------- TESTING MQTT WILL CONFIGURATION ---------");
-    //
-    // // First, query the current will configuration
-    // qmtcfg_write_will_response_t will_response = {0};
-    // err = bg95_mqtt_config_query_will(bg95_handle, 0, &will_response);
-    //
-    // if (err != ESP_OK)
-    // {
-    //   ESP_LOGE(TAG, "Failed to query MQTT will configuration: %s", esp_err_to_name(err));
-    //   return;
-    // }
-    //
-    // // Display current configuration
-    // if (will_response.present.has_will_flag)
-    // {
-    //   if (will_response.will_flag == QMTCFG_WILL_FLAG_IGNORE)
-    //   {
-    //     ESP_LOGI(TAG, "Current MQTT will configuration: Disabled");
-    //   }
-    //   else
-    //   {
-    //     ESP_LOGI(TAG, "Current MQTT will configuration: Enabled");
-    //
-    //     if (will_response.present.has_will_qos)
-    //     {
-    //       ESP_LOGI(TAG, "  QoS: %d", will_response.will_qos);
-    //     }
-    //
-    //     if (will_response.present.has_will_retain)
-    //     {
-    //       ESP_LOGI(TAG,
-    //                "  Retain: %s",
-    //                will_response.will_retain == QMTCFG_WILL_RETAIN_ENABLE ? "Yes" : "No");
-    //     }
-    //
-    //     if (will_response.present.has_will_topic)
-    //     {
-    //       ESP_LOGI(TAG, "  Topic: %s", will_response.will_topic);
-    //     }
-    //
-    //     if (will_response.present.has_will_message)
-    //     {
-    //       ESP_LOGI(TAG, "  Message: %s", will_response.will_message);
-    //     }
-    //   }
-    // }
-    // else
-    // {
-    //   ESP_LOGW(TAG, "No will configuration found");
-    // }
-    //
-    // // Now set a new will configuration
-    // // For testing, we'll toggle between enabling and disabling will
-    // qmtcfg_will_flag_t new_will_flag;
-    //
-    // if (will_response.present.has_will_flag)
-    // {
-    //   // Toggle the current setting
-    //   new_will_flag = (will_response.will_flag == QMTCFG_WILL_FLAG_REQUIRE)
-    //                       ? QMTCFG_WILL_FLAG_IGNORE
-    //                       : QMTCFG_WILL_FLAG_REQUIRE;
-    // }
-    // else
-    // {
-    //   // Default to enabling will if current setting is unknown
-    //   new_will_flag = QMTCFG_WILL_FLAG_REQUIRE;
-    // }
-    //
-    // if (new_will_flag == QMTCFG_WILL_FLAG_IGNORE)
-    // {
-    //   // Disable will
-    //   ESP_LOGI(TAG, "Disabling MQTT will");
-    //
-    //   err = bg95_mqtt_config_set_will(bg95_handle, 0, QMTCFG_WILL_FLAG_IGNORE, 0, 0, NULL, NULL);
-    // }
-    // else
-    // {
-    //   // Enable will with sample settings
-    //   qmtcfg_will_qos_t    new_will_qos     = QMTCFG_WILL_QOS_1;          // At least once
-    //   qmtcfg_will_retain_t new_will_retain  = QMTCFG_WILL_RETAIN_DISABLE; // Don't retain
-    //   const char*          new_will_topic   = "device/offline";
-    //   const char*          new_will_message = "Device disconnected unexpectedly";
-    //
-    //   ESP_LOGI(TAG, "Enabling MQTT will with:");
-    //   ESP_LOGI(TAG, "  QoS: %d", new_will_qos);
-    //   ESP_LOGI(TAG, "  Retain: %s", new_will_retain == QMTCFG_WILL_RETAIN_ENABLE ? "Yes" : "No");
-    //   ESP_LOGI(TAG, "  Topic: %s", new_will_topic);
-    //   ESP_LOGI(TAG, "  Message: %s", new_will_message);
-    //
-    //   err = bg95_mqtt_config_set_will(bg95_handle,
-    //                                   0,
-    //                                   QMTCFG_WILL_FLAG_REQUIRE,
-    //                                   new_will_qos,
-    //                                   new_will_retain,
-    //                                   new_will_topic,
-    //                                   new_will_message);
-    // }
-    //
-    // if (err != ESP_OK)
-    // {
-    //   ESP_LOGE(TAG, "Failed to set MQTT will configuration: %s", esp_err_to_name(err));
-    //   return;
-    // }
-    //
-    // // Query again to verify the changes
-    // memset(&will_response, 0, sizeof(will_response));
-    // err = bg95_mqtt_config_query_will(bg95_handle, 0, &will_response);
-    //
-    // if (err != ESP_OK)
-    // {
-    //   ESP_LOGE(
-    //       TAG, "Failed to query MQTT will configuration after update: %s", esp_err_to_name(err));
-    //   return;
-    // }
-    //
-    // // Verify the new configuration
-    // if (will_response.present.has_will_flag)
-    // {
-    //   if (will_response.will_flag == QMTCFG_WILL_FLAG_IGNORE)
-    //   {
-    //     ESP_LOGI(TAG, "Updated MQTT will configuration: Disabled");
-    //
-    //     if (new_will_flag == QMTCFG_WILL_FLAG_IGNORE)
-    //     {
-    //       ESP_LOGI(TAG, "Will configuration successfully updated (disabled)!");
-    //     }
-    //     else
-    //     {
-    //       ESP_LOGW(TAG, "Will flag doesn't match the requested value (should be enabled)");
-    //     }
-    //   }
-    //   else
-    //   {
-    //     ESP_LOGI(TAG, "Updated MQTT will configuration: Enabled");
-    //
-    //     if (new_will_flag == QMTCFG_WILL_FLAG_REQUIRE)
-    //     {
-    //       ESP_LOGI(TAG, "Will configuration successfully updated (enabled)!");
-    //
-    //       // Log details of the enabled will configuration
-    //       if (will_response.present.has_will_qos)
-    //       {
-    //         ESP_LOGI(TAG, "  QoS: %d", will_response.will_qos);
-    //       }
-    //
-    //       if (will_response.present.has_will_retain)
-    //       {
-    //         ESP_LOGI(TAG,
-    //                  "  Retain: %s",
-    //                  will_response.will_retain == QMTCFG_WILL_RETAIN_ENABLE ? "Yes" : "No");
-    //       }
-    //
-    //       if (will_response.present.has_will_topic)
-    //       {
-    //         ESP_LOGI(TAG, "  Topic: %s", will_response.will_topic);
-    //       }
-    //
-    //       if (will_response.present.has_will_message)
-    //       {
-    //         ESP_LOGI(TAG, "  Message: %s", will_response.will_message);
-    //       }
-    //     }
-    //     else
-    //     {
-    //       ESP_LOGW(TAG, "Will flag doesn't match the requested value (should be disabled)");
-    //     }
-    //   }
-    // }
-    // else
-    // {
-    //   ESP_LOGW(TAG, "No will configuration found after update");
-    // }
-    //
-    // ESP_LOGI(TAG, "--------- MQTT WILL CONFIGURATION TEST COMPLETE ---------");
-    //
-    // ESP_LOGI(TAG, "--------- TESTING MQTT RECEIVE MODE CONFIGURATION ---------");
-    //
-    // // First, query the current receive mode configuration
-    // qmtcfg_write_recv_mode_response_t recv_mode_response = {0};
-    // err = bg95_mqtt_config_query_recv_mode(bg95_handle, 0, &recv_mode_response);
-    //
-    // if (err != ESP_OK)
-    // {
-    //   ESP_LOGE(TAG, "Failed to query MQTT receive mode configuration: %s", esp_err_to_name(err));
-    //   return;
-    // }
-    //
-    // // Display current configuration
-    // ESP_LOGI(TAG, "Current MQTT receive mode configuration:");
-    //
-    // qmtcfg_msg_recv_mode_t  current_msg_recv_mode  = QMTCFG_MSG_RECV_MODE_CONTAIN_IN_URC; //
-    // Default qmtcfg_msg_len_enable_t current_msg_len_enable = QMTCFG_MSG_LEN_DISABLE; // Default
-    //
-    // if (recv_mode_response.present.has_msg_recv_mode)
-    // {
-    //   current_msg_recv_mode = recv_mode_response.msg_recv_mode;
-    //   ESP_LOGI(TAG,
-    //            "  Message receive mode: %s",
-    //            current_msg_recv_mode == QMTCFG_MSG_RECV_MODE_CONTAIN_IN_URC
-    //                ? "Contained in URC"
-    //                : "Not contained in URC");
-    // }
-    // else
-    // {
-    //   ESP_LOGW(TAG, "  Message receive mode information not available");
-    // }
-    //
-    // if (recv_mode_response.present.has_msg_len_enable)
-    // {
-    //   current_msg_len_enable = recv_mode_response.msg_len_enable;
-    //   ESP_LOGI(TAG,
-    //            "  Message length: %s",
-    //            current_msg_len_enable == QMTCFG_MSG_LEN_ENABLE ? "Contained in URC"
-    //                                                            : "Not contained in URC");
-    // }
-    // else
-    // {
-    //   ESP_LOGW(TAG, "  Message length enable information not available");
-    // }
-    //
-    // // Now set new receive mode parameters that are different from current values
-    // qmtcfg_msg_recv_mode_t new_msg_recv_mode =
-    //     (current_msg_recv_mode == QMTCFG_MSG_RECV_MODE_CONTAIN_IN_URC)
-    //         ? QMTCFG_MSG_RECV_MODE_NOT_CONTAIN_IN_URC
-    //         : QMTCFG_MSG_RECV_MODE_CONTAIN_IN_URC;
-    //
-    // qmtcfg_msg_len_enable_t new_msg_len_enable = (current_msg_len_enable ==
-    // QMTCFG_MSG_LEN_ENABLE)
-    //                                                  ? QMTCFG_MSG_LEN_DISABLE
-    //                                                  : QMTCFG_MSG_LEN_ENABLE;
-    //
-    // ESP_LOGI(TAG, "Setting new receive mode parameters:");
-    // ESP_LOGI(TAG,
-    //          "  Message receive mode: %s",
-    //          new_msg_recv_mode == QMTCFG_MSG_RECV_MODE_CONTAIN_IN_URC ? "Contained in URC"
-    //                                                                   : "Not contained in URC");
-    // ESP_LOGI(TAG,
-    //          "  Message length: %s",
-    //          new_msg_len_enable == QMTCFG_MSG_LEN_ENABLE ? "Contained in URC"
-    //                                                      : "Not contained in URC");
-    //
-    // err = bg95_mqtt_config_set_recv_mode(bg95_handle, 0, new_msg_recv_mode, new_msg_len_enable);
-    //
-    // if (err != ESP_OK)
-    // {
-    //   ESP_LOGE(TAG, "Failed to set MQTT receive mode parameters: %s", esp_err_to_name(err));
-    //   return;
-    // }
-    //
-    // // Query again to verify the changes
-    // memset(&recv_mode_response, 0, sizeof(recv_mode_response));
-    // err = bg95_mqtt_config_query_recv_mode(bg95_handle, 0, &recv_mode_response);
-    //
-    // if (err != ESP_OK)
-    // {
-    //   ESP_LOGE(TAG,
-    //            "Failed to query MQTT receive mode parameters after update: %s",
-    //            esp_err_to_name(err));
-    //   return;
-    // }
-    //
-    // // Verify the new configuration
-    // ESP_LOGI(TAG, "Updated MQTT receive mode configuration:");
-    //
-    // all_params_match = true;
-    //
-    // if (recv_mode_response.present.has_msg_recv_mode)
-    // {
-    //   ESP_LOGI(TAG,
-    //            "  Message receive mode: %s",
-    //            recv_mode_response.msg_recv_mode == QMTCFG_MSG_RECV_MODE_CONTAIN_IN_URC
-    //                ? "Contained in URC"
-    //                : "Not contained in URC");
-    //
-    //   if (recv_mode_response.msg_recv_mode != new_msg_recv_mode)
-    //   {
-    //     ESP_LOGW(TAG, "  Message receive mode doesn't match the requested value");
-    //     all_params_match = false;
-    //   }
-    // }
-    // else
-    // {
-    //   ESP_LOGW(TAG, "  Message receive mode information not available after update");
-    //   all_params_match = false;
-    // }
-    //
-    // if (recv_mode_response.present.has_msg_len_enable)
-    // {
-    //   ESP_LOGI(TAG,
-    //            "  Message length: %s",
-    //            recv_mode_response.msg_len_enable == QMTCFG_MSG_LEN_ENABLE ? "Contained in URC"
-    //                                                                       : "Not contained in
-    //                                                                       URC");
-    //
-    //   if (recv_mode_response.msg_len_enable != new_msg_len_enable)
-    //   {
-    //     ESP_LOGW(TAG, "  Message length enable doesn't match the requested value");
-    //     all_params_match = false;
-    //   }
-    // }
-    // else
-    // {
-    //   ESP_LOGW(TAG, "  Message length enable information not available after update");
-    //   all_params_match = false;
-    // }
-    //
-    // if (all_params_match)
-    // {
-    //   ESP_LOGI(TAG, "All receive mode parameters successfully updated!");
-    // }
-    // else
-    // {
-    //   ESP_LOGW(TAG, "Some receive mode parameters don't match the requested values");
-    // }
-    //
-    // ESP_LOGI(TAG, "--------- MQTT RECEIVE MODE CONFIGURATION TEST COMPLETE ---------");
-
-    // vTaskDelay(pdMS_TO_TICKS(1000));
+    // Wait before next connection cycle
+    vTaskDelay(pdMS_TO_TICKS(10000));
   }
 }
 
 void app_main(void)
 {
-  ESP_LOGI(TAG, "BG95 Driver Dev Project Main started ...");
+  ESP_LOGI(TAG, "BG95 Driver Dev Project with MQTT Publish started ...");
 
   config_and_init_uart();
   init_bg95();
 
-  // TODO: check if already connected to network - if so, then skip the step to connect to network
-
-  BaseType_t ret = xTaskCreate(
-      connect_to_cell_network_task, "conn_to_network_bearer_task", 24000, &handle, 2, NULL);
+  // Create a task with larger stack for connection and MQTT operations
+  BaseType_t ret = xTaskCreate(connect_and_publish_task,
+                               "connect_publish_task",
+                               24000, // Large stack size to prevent overflow
+                               &handle,
+                               2,
+                               NULL);
 
   if (ret != pdPASS)
   {
-    ESP_LOGE(TAG, "ERROR creating conn to network bearer task failed");
+    ESP_LOGE(TAG, "ERROR creating connect and publish task failed");
     return;
   }
 }

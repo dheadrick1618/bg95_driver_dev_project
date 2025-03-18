@@ -22,6 +22,9 @@ void run_test_at_cmd_qmtopen_all(void);
 void run_test_at_cmd_qmtclose_all(void);
 void run_test_at_cmd_qmtconn_all(void);
 void run_test_at_cmd_qmtdisc_all(void);
+void run_test_at_cmd_qmtpub_all(void);
+void run_test_at_cmd_qmtsub_all(void);
+void run_test_at_cmd_qmtuns_all(void);
 
 /* Define test suite information */
 typedef struct
@@ -44,6 +47,9 @@ static const test_suite_t test_suites[] = {
     {"AT CMD: QMTCLOSE Tests", run_test_at_cmd_qmtclose_all},
     {"AT CMD: QMTCONN Tests", run_test_at_cmd_qmtconn_all},
     {"AT CMD: QMTDISC Tests", run_test_at_cmd_qmtdisc_all},
+    {"AT CMD: QMTPUB Tests", run_test_at_cmd_qmtpub_all},
+    {"AT CMD: QMTPUB Tests", run_test_at_cmd_qmtsub_all},
+    {"AT CMD: QMTPUB Tests", run_test_at_cmd_qmtuns_all},
 };
 
 #define NUM_TEST_SUITES (sizeof(test_suites) / sizeof(test_suite_t))
